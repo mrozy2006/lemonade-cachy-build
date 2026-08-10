@@ -80,39 +80,95 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build unzip curl zstd patchelf jq libvulkan-dev glslc spirv-headers
 
-      - name: Download TheRock ROCm SDK (ROCm backend only)
-        if: matrix.backend == 'rocm'
+      - name: Download and extract ROCm directly to /opt/rocm
         run: |
+          # Determine ROCm version to use
           rocm_version="${{ env.ROCM_VERSION }}"
-          gfx="${{ matrix.gfx_target }}"
-          s3_target="$gfx"
-          case "$gfx" in
-            gfx103X|gfx110X|gfx120X) s3_target="${gfx}-all" ;;
-          esac
+          current_target="${{ matrix.gfx_target }}"
+          
+          # Add appropriate suffixes for different GPU targets
+          s3_target="$current_target"
+          if [[ "$current_target" = "gfx103X" || "$current_target" = "gfx110X" || "$current_target" = "gfx120X" ]]; then
+            s3_target="${current_target}-all"
+            echo "Using target with -all suffix: $s3_target"
+          fi
+          
+          # TheRock now publishes nightlies to the multi-arch tarball index. That
+          # index is a static HTML page with an embedded JSON `files` array (name +
+          # mtime), so we parse that instead of the retired S3 XML bucket listing.
           base_url="https://rocm.nightlies.amd.com/tarball-multi-arch"
           if [ "$rocm_version" = "latest" ]; then
+            echo "Auto-detecting latest ROCm version for target: $current_target"
             prefix="therock-dist-linux-${s3_target}-"
+  
             files_json=$(curl -s "$base_url/" | tr '\n' ' ' | grep -oP 'const files = \K\[.*?\](?=\s*;)')
+            if [ -z "$files_json" ]; then
+              echo "Failed to parse file index from $base_url/"
+              exit 1
+            fi
+  
+            # Pick the newest by the YYYYMMDD build date embedded in the filename.
+            # Anchor the match so the version comes immediately after the prefix.
+            # This excludes variants like "...-all-tests-<version>.tar.gz" that
+            # TheRock also publishes and share the same prefix/date.
             latest_file=$(echo "$files_json" | jq -r --arg p "$prefix" \
-              '[.[] | select(.name | startswith($p)) | select(.name | test("[0-9]{8}\\.tar\\.gz$")) | select(.name | test("-tests-") | not)] | sort_by(.name | capture("(?<d>[0-9]{8})\\.tar\\.gz$").d) | last | .name // empty')
-            [ -n "$latest_file" ] || { echo "No tarball for $prefix"; exit 1; }
-            rocm_version=$(echo "$latest_file" | grep -oP 'therock-dist-linux-'"$s3_target"'-\K[0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+')
+              '[.[] | select(.name | test("^" + $p + "[0-9]+\\.[0-9]+\\.[0-9]+(a|rc)[0-9]+\\.tar\\.gz$"))] | sort_by(.name | capture("(?<d>[0-9]{8})\\.tar\\.gz$").d) | last | .name // empty')
+            if [ -z "$latest_file" ]; then
+              echo "No tarball found for prefix '$prefix' at $base_url/"
+              exit 1
+            fi
+            echo "Found latest file: $latest_file"
+  
+            # Extract version from the filename for environment variable
+            if [[ "$latest_file" =~ therock-dist-linux-${s3_target}-([0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+)\.tar\.gz ]]; then
+              rocm_version="${BASH_REMATCH[1]}"
+              echo "Detected latest ROCm version: $rocm_version"
+            else
+              echo "Failed to extract ROCm version from latest file: $latest_file"
+              echo "Expected pattern: therock-dist-linux-${s3_target}-<version>.tar.gz"
+              exit 1
+            fi
+  
             rocm_url="$base_url/$latest_file"
           else
+            # For specific versions, construct the URL directly
             rocm_url="$base_url/therock-dist-linux-${s3_target}-${rocm_version}.tar.gz"
           fi
-          echo "DETECTED_ROCM_VERSION=$rocm_version" >> "$GITHUB_ENV"
+          
+          # Store the version for use in other steps
+          echo "DETECTED_ROCM_VERSION=$rocm_version" >> $GITHUB_ENV
+          
+          echo "Streaming ROCm from: $rocm_url directly to extraction"
+          
+          # Create directory if it doesn't exist
           sudo mkdir -p /opt/rocm
+          
+          # Stream download directly into tar extraction (no intermediate file)
           curl -sL "$rocm_url" | sudo tar --use-compress-program=gzip -xf - -C /opt/rocm --strip-components=1
 
-      - name: Set ROCm env (ROCm backend only)
-        if: matrix.backend == 'rocm'
+      - name: Set ROCm environment variables
         run: |
-          echo "HIP_PATH=/opt/rocm" >> "$GITHUB_ENV"
-          echo "ROCM_PATH=/opt/rocm" >> "$GITHUB_ENV"
-          echo "HIP_CLANG_PATH=/opt/rocm/llvm/bin" >> "$GITHUB_ENV"
-          echo "/opt/rocm/bin:/opt/rocm/llvm/bin" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib" >> "$GITHUB_ENV"
+          echo "Setting ROCm environment variables..."
+          
+          # Set environment variables for this step and subsequent steps
+          echo "HIP_PATH=/opt/rocm" >> $GITHUB_ENV
+          echo "ROCM_PATH=/opt/rocm" >> $GITHUB_ENV
+          echo "HIP_PLATFORM=amd" >> $GITHUB_ENV
+          echo "HIP_CLANG_PATH=/opt/rocm/llvm/bin" >> $GITHUB_ENV
+          echo "HIP_INCLUDE_PATH=/opt/rocm/include" >> $GITHUB_ENV
+          echo "HIP_LIB_PATH=/opt/rocm/lib" >> $GITHUB_ENV
+          echo "HIP_DEVICE_LIB_PATH=/opt/rocm/lib/llvm/amdgcn/bitcode" >> $GITHUB_ENV
+          
+          # Update PATH
+          echo "/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH" >> $GITHUB_PATH
+          
+          # Set library paths
+          echo "LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:${LIBRARY_PATH:-}" >> $GITHUB_ENV
+          echo "CPATH=/opt/rocm/include:${CPATH:-}" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/opt/rocm/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> $GITHUB_ENV
+          
+          echo "ROCm environment variables set successfully"
 
       - name: Clone CachyLLama
         run: |
