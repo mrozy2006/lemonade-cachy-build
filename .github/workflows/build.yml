@@ -173,7 +173,7 @@ jobs:
       - name: Clone CachyLLama
         run: |
           ref="${{ env.CACHYLLAMA_REF }}"
-          git clone --no-checkout --filter=tree:0 https://github.com/fewtarius/CachyLLama.git llama.cpp
+          git clone --no-checkout --filter=tree:0 https://github.com/mrozy2006/CachyLLama.git llama.cpp
           cd llama.cpp
           # Resolve ref to a commit. Works for SHA, tag, or branch.
           # `git fetch --depth 1 origin <ref>` works for tags/branches; for a raw
